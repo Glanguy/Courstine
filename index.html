@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Courstine</title>
+  <meta name="description" content="Planifie tes repas de la semaine, garde tes recettes et obtiens ta liste de courses avec les totaux.">
+  <meta name="theme-color" content="#76BB40">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Courstine">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="app">
+    <header class="masthead">
+      <h1><a class="logo" href="#/" aria-label="Courstine, retour à l'accueil">Courstine</a></h1>
+    </header>
+    <nav class="tabs" id="tabs" aria-label="Navigation principale">
+      <a class="pill pill-green" href="#/menus" data-tab="menus">Menus</a>
+      <a class="pill pill-orange" href="#/courses" data-tab="courses">Courses</a>
+      <a class="pill pill-pink" href="#/recettes" data-tab="recettes">Recettes</a>
+    </nav>
+    <main id="view" tabindex="-1"></main>
+  </div>
+  <div id="sheet-root"></div>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <noscript><p style="padding:24px">Courstine a besoin de JavaScript pour fonctionner.</p></noscript>
+
+  <script src="js/lib.js"></script>
+  <script src="js/store.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

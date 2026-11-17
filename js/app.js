@@ -10,7 +10,7 @@
   const $ = (s, r = document) => r.querySelector(s);
   const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  const save = () => S.save(state);
+  const save = () => { tidy(); S.save(state); };
   const recipe = (id) => state.recipes.find((r) => r.id === id);
   const FOLDER = { sale: 'Recettes salées', sucre: 'Recettes sucrées' };
   const fmtWeekday = new Intl.DateTimeFormat('fr-FR', { weekday: 'long' });
@@ -70,18 +70,56 @@
     </div>`;
   }
 
-  /* ---------- Liste de courses ---------- */
-  function currentItems(days) {
-    const weekKey = C.iso(days[0]);
-    const items = C.shoppingForWeek(state, days).map((it) => ({ ...it, k: weekKey + '|' + it.id, done: !!state.checked[weekKey + '|' + it.id] }));
-    return items;
+  /* ---------- Liste de courses (une seule, pour tout) ---------- */
+  const todayIso = () => C.iso(new Date());
+  const listItems = () => C.shoppingList(state, todayIso());
+  const findItem = (id) => listItems().find((it) => it.id === id);
+  const sortItems = (items) => [...items.filter((i) => !i.done), ...items.filter((i) => i.done)];
+
+  // Ménage : achats supprimés de repas passés ou retirés, corrections orphelines, coches périmées
+  function tidy() {
+    const today = todayIso();
+    Object.keys(state.cleared).forEach((k) => {
+      const [day, slot, rest] = k.split('|');
+      const rid = (rest || '').split('#')[0];
+      if (day < today || planGet(day, slot) !== rid) delete state.cleared[k];
+    });
+    const items = C.shoppingList(state, today);
+    const withRecipe = new Set(items.filter((i) => i.rq > 0).map((i) => i.id));
+    state.extras = state.extras.filter((x) => !(x.qty != null && x.qty < 0 && !withRecipe.has(C.itemId(x.name, x.qty, x.unit))));
+    const visible = new Set(items.map((i) => i.id));
+    Object.keys(state.checked).forEach((k) => { if (!visible.has(k)) delete state.checked[k]; });
+  }
+
+  // Retire un article de la liste : ce que les repas en apportaient est considéré comme acheté
+  function consumeItem(it) {
+    it.occs.forEach((occ) => { state.cleared[occ + '#' + it.key] = 1; });
+    state.extras = state.extras.filter((x) => {
+      const id = C.itemId(x.name, x.qty, x.unit);
+      return id !== it.id && !(x.qty == null && C.nameKey(x.name) === it.key);
+    });
+    delete state.checked[it.id];
+  }
+
+  // Quand on déplace un repas, ce qui a déjà été acheté pour lui le suit
+  function moveCleared(a, b, ridA, ridB) {
+    const pa = `${a.iso}|${a.slot}|${ridA}#`;
+    const pb = ridB ? `${b.iso}|${b.slot}|${ridB}#` : null;
+    const moved = {};
+    Object.keys(state.cleared).forEach((k) => {
+      if (k.startsWith(pa)) { moved[`${b.iso}|${b.slot}|${ridA}#` + k.slice(pa.length)] = 1; delete state.cleared[k]; }
+      else if (pb && k.startsWith(pb)) { moved[`${a.iso}|${a.slot}|${ridB}#` + k.slice(pb.length)] = 1; delete state.cleared[k]; }
+    });
+    Object.assign(state.cleared, moved);
   }
 
   function itemHTML(it) {
     return `<li class="item${it.done ? ' done' : ''}">
-      <button type="button" class="check" data-action="toggle-item" data-k="${esc(it.k)}" aria-pressed="${it.done}" aria-label="${esc(it.name)}">${I.check}</button>
-      <div class="item-main"><span class="item-name">${esc(it.name)}</span>${it.from && it.from.length ? `<span class="item-from">${esc(it.from.join(', '))}</span>` : ''}</div>
-      <span class="item-qty">${esc(it.text)}</span>
+      <button type="button" class="check" data-action="toggle-item" data-id="${esc(it.id)}" aria-pressed="${it.done}" aria-label="${esc(it.name)}">${I.check}</button>
+      <button type="button" class="item-edit" data-action="edit-item" data-id="${esc(it.id)}" aria-label="Modifier ${esc(it.name)}">
+        <span class="item-main"><span class="item-name">${esc(it.name)}</span>${it.from && it.from.length ? `<span class="item-from">${esc(it.from.join(', '))}</span>` : ''}</span>
+        <span class="item-qty">${esc(it.text)}</span>
+      </button>
     </li>`;
   }
 
@@ -89,7 +127,7 @@
   function viewHome() {
     const today = new Date();
     const days = Array.from({ length: 5 }, (_, i) => C.addDays(today, i));
-    const items = currentItems(C.weekDays(0));
+    const items = sortItems(listItems());
     const shown = items.slice(0, 6);
     const names = ["Aujourd'hui", 'Demain'];
     return `<div class="stack">
@@ -148,35 +186,46 @@
       </div>`;
   }
 
+  function unitOptions(cur) {
+    return C.UNITS.map((u) => `<option value="${esc(u)}"${u === cur ? ' selected' : ''}>${u ? esc(u) : 'pièce(s)'}</option>`).join('');
+  }
+
   function viewCourses() {
-    const days = C.weekDays(ui.weekOffset);
-    const items = currentItems(days);
-    const extras = state.extras;
-    const total = items.length + extras.length;
-    const done = items.filter((i) => i.done).length + extras.filter((e) => e.done).length;
+    const items = listItems();
+    const todo = items.filter((i) => !i.done);
+    const done = items.filter((i) => i.done);
+    const total = items.length;
     const groups = [];
-    items.forEach((it) => {
+    todo.forEach((it) => {
       let g = groups.find((x) => x.cat === it.cat);
       if (!g) groups.push((g = { cat: it.cat, list: [] }));
       g.list.push(it);
     });
-    return `${weekBar(days)}
-      ${total ? `<div class="progress"><span>${done} sur ${total} dans le panier</span>${done ? `<button type="button" data-action="uncheck-all">Tout décocher</button>` : ''}</div>
-        <div class="bar" aria-hidden="true"><i style="width:${total ? Math.round((done / total) * 100) : 0}%"></i></div>` : ''}
-      ${!items.length ? `<section class="card empty">
+    return `<form class="card addform" id="add-form" autocomplete="off">
+        <label class="sr" for="add-name">Article à ajouter</label>
+        <input id="add-name" class="name" type="text" maxlength="80" placeholder="Ajouter un article (ex. farine)">
+        <div class="row">
+          <label class="sr" for="add-qty">Quantité</label>
+          <input id="add-qty" class="qty" type="text" inputmode="decimal" maxlength="8" placeholder="Qté">
+          <label class="sr" for="add-unit">Unité</label>
+          <select id="add-unit">${unitOptions('')}</select>
+          <button class="btn-primary" type="submit">Ajouter</button>
+        </div>
+      </form>
+      ${total ? `<div class="progress"><span>${done.length} sur ${total} dans le panier</span>${done.length ? `<button type="button" data-action="uncheck-all">Tout décocher</button>` : ''}</div>
+        <div class="bar" aria-hidden="true"><i style="width:${Math.round((done.length / total) * 100)}%"></i></div>` : ''}
+      ${!total ? `<section class="card empty">
           <div class="plate">${I.plus}</div>
-          <p><strong>Aucun repas prévu cette semaine.</strong><br>Planifie des recettes dans Menus : leurs ingrédients s’additionnent ici.</p>
+          <p><strong>Ta liste est vide.</strong><br>Planifie des repas dans Menus : leurs ingrédients arrivent ici tout seuls. Tu peux aussi ajouter un article ci-dessus.</p>
           <a class="btn-primary" style="display:inline-block;text-decoration:none" href="#/menus">Planifier les repas</a>
-        </section>` : groups.map((g) => `<section class="card group" style="margin-bottom:14px"><h3>${esc(g.cat)}</h3><ul class="items">${g.list.map(itemHTML).join('')}</ul></section>`).join('')}
-      ${extras.length ? `<section class="card group"><h3>Ajouts</h3><ul class="items">${extras.map((e) => `<li class="item${e.done ? ' done' : ''}">
-          <button type="button" class="check" data-action="toggle-extra" data-id="${esc(e.id)}" aria-pressed="${e.done}" aria-label="${esc(e.text)}">${I.check}</button>
-          <div class="item-main"><span class="item-name">${esc(e.text)}</span></div>
-          <button type="button" class="x" data-action="del-extra" data-id="${esc(e.id)}" aria-label="Supprimer ${esc(e.text)}">${I.close}</button></li>`).join('')}</ul></section>` : ''}
-      <form class="addline" id="extra-form" autocomplete="off">
-        <label class="sr" for="extra-input">Ajouter un article</label>
-        <input id="extra-input" type="text" maxlength="80" placeholder="Ajouter un article (ex. papier toilette)">
-        <button class="btn-primary" type="submit">Ajouter</button>
-      </form>`;
+        </section>` : ''}
+      ${groups.map((g) => `<section class="card group" style="margin-bottom:14px"><h3>${esc(g.cat)}</h3><ul class="items">${g.list.map(itemHTML).join('')}</ul></section>`).join('')}
+      ${done.length ? `<section class="card group basket">
+          <div class="basket-head"><h3>Dans le panier (${done.length})</h3>
+            <button type="button" class="btn-danger btn-sm" data-action="clear-done">${I.trash}Tout supprimer</button></div>
+          <ul class="items">${done.map(itemHTML).join('')}</ul>
+        </section>` : ''}
+      <p class="hint" style="text-align:center;margin-top:14px">Touche un article pour changer sa quantité ou son unité.</p>`;
   }
 
   function recipeCard(r) {
@@ -223,6 +272,7 @@
         <button type="button" class="fchip" data-action="filter-fav" aria-pressed="${ui.filter === 'fav'}">${I.heart}Favoris</button>
         <button type="button" class="fchip" data-action="sort-rating" aria-pressed="${ui.sort === 'rating'}">${I.star}Mieux notées d’abord</button>
       </div>
+      <button type="button" class="list-btn tt-btn" data-action="tt-open"><span class="plate sm">🎵</span><span>Importer une recette TikTok<small>Depuis un lien ou le raccourci iPhone</small></span></button>
       ${section('sale')}${section('sucre')}
       <button type="button" class="fab" data-action="new-recipe" aria-label="Nouvelle recette">${I.plus}</button>`;
   }
@@ -384,11 +434,12 @@
 
   /* Formulaire de recette */
   const EMOJIS = ['🍽️', '🍝', '🍗', '🥗', '🍲', '🥘', '🍕', '🌮', '🍳', '🥞', '🍰', '🍎', '🍫', '🍪', '🍓', '🧁'];
-  function openForm(id) {
-    const r = id ? recipe(id) : null;
-    sheetState = { id: id || '', emoji: r ? r.emoji : EMOJIS[0] };
+  function openForm(id, prefill) {
+    const r = id ? recipe(id) : prefill || null;
+    sheetState = { id: id || '', emoji: r && r.emoji ? r.emoji : EMOJIS[0] };
     openSheet(() => `<form id="recipe-form" novalidate>
-        <h2>${r ? 'Modifier la recette' : 'Nouvelle recette'}</h2>
+        <h2>${id ? 'Modifier la recette' : prefill ? 'Vérifie la recette importée' : 'Nouvelle recette'}</h2>
+        ${prefill ? `<p class="sub">${prefill.ingredients.length ? 'Corrige les ingrédients si besoin : chaque ligne apparaît en dessous telle qu’elle sera comptée.' : 'Aucun ingrédient reconnu dans la description : ajoute-les à la main, une ligne par ingrédient.'}</p>` : ''}
         <label for="f-title">Nom</label>
         <input id="f-title" type="text" maxlength="80" value="${esc(r ? r.title : '')}" placeholder="Ex. Crêpes">
         <p class="hint" id="f-err" role="alert" style="color:#B3201B"></p>
@@ -411,7 +462,7 @@
           <button type="button" class="btn-ghost" data-action="close-sheet">Annuler</button>
           <button type="submit" class="btn-primary">Enregistrer</button>
         </div>
-      </form>`, r ? 'Modifier la recette' : 'Nouvelle recette');
+      </form>`, id ? 'Modifier la recette' : 'Nouvelle recette');
     updatePreview();
   }
   function updatePreview() {
@@ -445,6 +496,138 @@
     save();
     closeSheet();
     render();
+  }
+
+  /* Modifier un article de la liste de courses */
+  function editValue(it) {
+    if (it.qty == null) return { qty: '', unit: '' };
+    if (it.unit === 'g' && it.qty >= 1000) return { qty: C.fmtNum(it.qty / 1000), unit: 'kg' };
+    if (it.unit === 'ml' && it.qty >= 1000) return { qty: C.fmtNum(it.qty / 1000), unit: 'l' };
+    return { qty: C.fmtNum(it.qty), unit: it.unit };
+  }
+  function openItem(id) {
+    const it = findItem(id);
+    if (!it) return;
+    const v = editValue(it);
+    sheetState = { id };
+    openSheet(() => `<form id="item-form" novalidate autocomplete="off">
+        <h2>${esc(it.name)}</h2>
+        ${it.from && it.from.length ? `<p class="sub">Pour : ${esc(it.from.join(', '))}</p>` : ''}
+        <div class="qty-row">
+          <div><label for="it-qty">Quantité</label>
+            <input id="it-qty" type="text" inputmode="decimal" maxlength="8" value="${esc(v.qty)}" placeholder="—"></div>
+          <div><label for="it-unit">Unité</label>
+            <select id="it-unit">${unitOptions(v.unit)}</select></div>
+        </div>
+        <p class="hint">Laisse la quantité vide pour un article sans quantité.</p>
+        <div class="sheet-actions">
+          <button type="button" class="btn-danger" data-action="del-item" data-id="${esc(id)}">Supprimer l’article</button>
+          <button type="button" class="btn-ghost" data-action="close-sheet">Annuler</button>
+          <button type="submit" class="btn-primary">Enregistrer</button>
+        </div>
+      </form>`, 'Modifier l’article');
+  }
+  const parseQty = (v) => {
+    const t = String(v || '').trim().replace(',', '.');
+    if (!t) return null;
+    const m = t.match(/^(\d+)\s*\/\s*(\d+)$/);
+    const n = m ? +m[1] / +m[2] : parseFloat(t);
+    return isFinite(n) && n > 0 ? n : NaN;
+  };
+  function saveItem() {
+    const it = findItem(sheetState.id);
+    if (!it) { closeSheet(); render(); return; }
+    const qty = parseQty($('#it-qty').value);
+    if (Number.isNaN(qty)) { toast('Quantité non reconnue'); return; }
+    const unit = qty == null ? '' : $('#it-unit').value;
+    const b = C.toBase(qty, unit);
+    if (it.qty != null && qty != null && b.unit === it.unit) {
+      // Même famille d'unité : on garde le lien avec les recettes et on corrige l'écart
+      state.extras = state.extras.filter((x) => C.itemId(x.name, x.qty, x.unit) !== it.id);
+      const diff = Math.round((b.qty - it.rq) * 1000) / 1000;
+      if (Math.abs(diff) > 0.0005) state.extras.push({ id: S.uid(), name: it.name, qty: diff, unit: it.unit });
+    } else {
+      // Autre unité : l'article devient un ajout à la main
+      consumeItem(it);
+      state.extras.push({ id: S.uid(), name: it.name, qty, unit });
+    }
+    delete state.checked[it.id];
+    save(); closeSheet(); render(); toast('Quantité modifiée');
+  }
+  function addItem() {
+    const nameEl = $('#add-name');
+    let name = nameEl.value.trim();
+    if (!name) { nameEl.focus(); return; }
+    let qty = parseQty($('#add-qty').value);
+    if (Number.isNaN(qty)) { toast('Quantité non reconnue'); return; }
+    let unit = qty == null ? '' : $('#add-unit').value;
+    if (qty == null) {
+      // « 500 g farine » tapé d'un coup fonctionne aussi
+      const p = C.parseLine(name);
+      if (p) { name = p.name; qty = p.qty; unit = p.unit; }
+    }
+    const id = C.itemId(name, qty, unit);
+    const existed = listItems().some((i) => i.id === id);
+    state.extras.push({ id: S.uid(), name: C.cap(name), qty, unit });
+    save(); render();
+    toast(existed ? 'Ajouté à l’article existant' : 'Article ajouté');
+    const n = $('#add-name'); if (n) n.focus();
+  }
+
+  /* Import TikTok */
+  const TT_URL = /https?:\/\/(?:[a-z0-9-]+\.)*tiktok\.com\/[^\s]+/i;
+  function openTikTok() {
+    sheetState = { status: '' };
+    openSheet(() => `<form id="tt-form" novalidate autocomplete="off">
+        <h2>Importer une recette TikTok</h2>
+        <p class="sub">Avec le raccourci iPhone : partage la vidéo vers « Courstine TikTok », puis appuie ici sur « Coller ».</p>
+        <button type="button" class="btn-primary tt-paste" data-action="tt-paste">Coller</button>
+        <label for="tt-url">Lien de la vidéo</label>
+        <input id="tt-url" type="url" inputmode="url" placeholder="https://www.tiktok.com/@…/video/…">
+        <button type="button" class="btn-ghost tt-read" data-action="tt-fetch">Lire la description depuis le lien</button>
+        <p class="tt-status" id="tt-status" role="status">${esc(sheetState.status)}</p>
+        <label for="tt-text">Description de la vidéo</label>
+        <textarea id="tt-text" rows="6" placeholder="La description arrive ici. Tu peux aussi la coller ou l’écrire à la main."></textarea>
+        <div class="sheet-actions">
+          <button type="button" class="btn-ghost" data-action="close-sheet">Annuler</button>
+          <button type="submit" class="btn-primary">Trouver les ingrédients</button>
+        </div>
+      </form>`, 'Importer une recette TikTok');
+  }
+  function ttStatus(msg) { const el = $('#tt-status'); if (el) el.textContent = msg; }
+  function ttFill(text) {
+    const m = String(text || '').match(TT_URL);
+    if (m) $('#tt-url').value = m[0];
+    const rest = String(text || '').replace(TT_URL, '').trim();
+    if (rest) $('#tt-text').value = rest;
+    return { url: !!m, text: !!rest };
+  }
+  async function ttFetch() {
+    const url = $('#tt-url').value.trim();
+    if (!TT_URL.test(url)) { ttStatus('Colle d’abord un lien TikTok.'); return; }
+    ttStatus('Lecture de la description…');
+    try {
+      const res = await fetch('https://www.tiktok.com/oembed?url=' + encodeURIComponent(url), { credentials: 'omit', referrerPolicy: 'no-referrer' });
+      if (!res.ok) throw new Error(String(res.status));
+      const data = await res.json();
+      if (!data || typeof data.title !== 'string' || !data.title.trim()) throw new Error('vide');
+      $('#tt-text').value = data.title;
+      ttStatus('Description récupérée.');
+      ttContinue();
+    } catch (e) {
+      ttStatus('TikTok a bloqué la lecture depuis le site. Utilise le raccourci iPhone, ou colle la description à la main.');
+    }
+  }
+  function ttContinue() {
+    const text = $('#tt-text').value.trim();
+    const url = $('#tt-url').value.trim();
+    if (!text) { ttStatus('Il manque la description de la vidéo.'); return; }
+    const r = C.extractRecipe(text);
+    closeSheet();
+    openForm('', {
+      title: r.title || 'Recette TikTok', folder: 'sale', emoji: '', steps: r.steps,
+      source: TT_URL.test(url) ? url : '', ingredients: r.ingredients,
+    });
   }
 
   /* Dossier, suppression, partage, sauvegarde */
@@ -505,15 +688,36 @@
       save(); render(); toast('Semaine vidée');
     },
     'picker-folder': (el) => { sheetState.folder = el.dataset.f; paintSheet(false); },
-    'toggle-item': (el) => { const k = el.dataset.k; if (state.checked[k]) delete state.checked[k]; else state.checked[k] = true; save(); render(); },
-    'uncheck-all': () => {
-      const wk = C.iso(C.weekDays(ui.weekOffset)[0]);
-      Object.keys(state.checked).forEach((k) => { if (k.startsWith(wk + '|')) delete state.checked[k]; });
-      state.extras.forEach((e) => { e.done = false; });
+    'toggle-item': (el) => {
+      const it = findItem(el.dataset.id);
+      if (!it) return;
+      if (it.done) delete state.checked[it.id]; else state.checked[it.id] = it.qty == null ? 0 : it.qty;
       save(); render();
     },
-    'toggle-extra': (el) => { const e = state.extras.find((x) => x.id === el.dataset.id); if (e) { e.done = !e.done; save(); render(); } },
-    'del-extra': (el) => { state.extras = state.extras.filter((x) => x.id !== el.dataset.id); save(); render(); },
+    'uncheck-all': () => { state.checked = {}; save(); render(); },
+    'clear-done': () => {
+      const done = listItems().filter((i) => i.done);
+      done.forEach(consumeItem);
+      save(); render();
+      toast(`${done.length} article${done.length > 1 ? 's' : ''} supprimé${done.length > 1 ? 's' : ''}`);
+    },
+    'edit-item': (el) => openItem(el.dataset.id),
+    'del-item': (el) => {
+      const it = findItem(el.dataset.id);
+      if (it) consumeItem(it);
+      save(); closeSheet(); render(); toast('Article supprimé');
+    },
+    'tt-open': () => openTikTok(),
+    'tt-fetch': () => ttFetch(),
+    'tt-paste': async () => {
+      let text = '';
+      try { text = await navigator.clipboard.readText(); } catch (e) { /* refusé */ }
+      if (!text) { ttStatus('Rien à coller. Appuie longuement dans la case « Description » puis « Coller ».'); return; }
+      const got = ttFill(text);
+      if (got.text) ttContinue();
+      else if (got.url) ttFetch();
+      else ttStatus('Le presse-papiers ne contient ni lien TikTok ni description.');
+    },
     'menu': (el) => { ui.menuId = ui.menuId === el.dataset.id ? null : el.dataset.id; render(); },
     'open-recipe': (el) => openRecipe(el.dataset.id),
     'edit-recipe': (el) => openForm(el.dataset.id),
@@ -607,11 +811,15 @@
 
   document.addEventListener('submit', (e) => {
     const f = e.target;
-    if (f.id === 'extra-form') {
+    if (f.id === 'add-form') {
       e.preventDefault();
-      const inp = $('#extra-input');
-      const text = inp.value.trim();
-      if (text) { state.extras.push({ id: S.uid(), text, done: false }); save(); render(); const n = $('#extra-input'); if (n) n.focus(); }
+      addItem();
+    } else if (f.id === 'item-form') {
+      e.preventDefault();
+      saveItem();
+    } else if (f.id === 'tt-form') {
+      e.preventDefault();
+      ttContinue();
     } else if (f.id === 'recipe-form') {
       e.preventDefault();
       saveForm();
@@ -626,7 +834,7 @@
         const data = JSON.parse(reader.result);
         if (!data || !Array.isArray(data.recipes)) throw new Error('format');
         const next = S.normalize(data);
-        state.recipes = next.recipes; state.plan = next.plan; state.checked = next.checked; state.extras = next.extras;
+        state.recipes = next.recipes; state.plan = next.plan; state.checked = next.checked; state.extras = next.extras; state.cleared = next.cleared;
         save(); closeSheet(); render(); toast('Sauvegarde restaurée');
       } catch (err) { toast('Fichier de sauvegarde non reconnu'); }
     };
@@ -692,6 +900,7 @@
       if (d.from) {
         if (!(d.from.iso === iso && d.from.slot === slot)) {
           const prev = planGet(iso, slot);
+          moveCleared(d.from, { iso, slot }, d.rid, prev);
           planSet(iso, slot, d.rid);
           planSet(d.from.iso, d.from.slot, prev);
           save(); render();
@@ -732,6 +941,7 @@
   document.addEventListener('contextmenu', (e) => { if (e.target.closest && e.target.closest('[data-drag]')) e.preventDefault(); });
 
   /* ---------- Démarrage ---------- */
+  save();
   window.addEventListener('hashchange', route);
   route();
   if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {

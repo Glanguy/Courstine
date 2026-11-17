@@ -3,7 +3,7 @@
 (function (root) {
   'use strict';
   const L = root.Courstine;
-  const KEY = 'courstine.v1';
+  const KEY = 'courstine.v1'; // même clé : les anciennes données sont reprises et converties
 
   const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-4);
 
@@ -57,11 +57,13 @@
   }
 
   function fresh() {
-    return { v: 1, recipes: sampleRecipes(), plan: samplePlan(), checked: {}, extras: [] };
+    return { v: 2, recipes: sampleRecipes(), plan: samplePlan(), checked: {}, extras: [], cleared: {} };
   }
 
+  const num = (x) => (typeof x === 'number' && isFinite(x) ? x : null);
+
   function normalize(s) {
-    const out = { v: 1, recipes: [], plan: {}, checked: {}, extras: [] };
+    const out = { v: 2, recipes: [], plan: {}, checked: {}, extras: [], cleared: {} };
     (Array.isArray(s.recipes) ? s.recipes : []).forEach((r) => {
       if (!r || typeof r.title !== 'string') return;
       out.recipes.push({
@@ -91,12 +93,26 @@
         if (Object.keys(clean).length) out.plan[k] = clean;
       });
     }
-    if (s.checked && typeof s.checked === 'object') {
-      Object.keys(s.checked).forEach((k) => { if (s.checked[k]) out.checked[k] = true; });
+    // Articles cochés : id -> quantité au moment où on a coché (version 2)
+    if (s.v === 2 && s.checked && typeof s.checked === 'object') {
+      Object.keys(s.checked).forEach((k) => { const n = num(s.checked[k]); if (n != null) out.checked[k] = n; });
     }
-    out.extras = (Array.isArray(s.extras) ? s.extras : [])
-      .filter((x) => x && typeof x.text === 'string' && x.text.trim())
-      .map((x) => ({ id: String(x.id || uid()), text: x.text.slice(0, 80), done: !!x.done }));
+    // Ajouts et corrections à la main. Version 1 : { text, done } -> converti
+    (Array.isArray(s.extras) ? s.extras : []).forEach((x) => {
+      if (!x) return;
+      let e = null;
+      if (typeof x.name === 'string' && x.name.trim()) {
+        e = { id: String(x.id || uid()), name: x.name.slice(0, 80), qty: num(x.qty), unit: typeof x.unit === 'string' ? x.unit : '' };
+      } else if (typeof x.text === 'string' && x.text.trim()) {
+        const p = L.parseLine(x.text.slice(0, 80));
+        if (p) e = { id: String(x.id || uid()), name: p.name, qty: p.qty, unit: p.unit };
+        if (e && x.done) out.checked[L.itemId(e.name, e.qty, e.unit)] = e.qty == null ? 0 : L.toBase(e.qty, e.unit).qty;
+      }
+      if (e) out.extras.push(e);
+    });
+    if (s.cleared && typeof s.cleared === 'object') {
+      Object.keys(s.cleared).forEach((k) => { if (s.cleared[k]) out.cleared[k] = 1; });
+    }
     return out;
   }
 

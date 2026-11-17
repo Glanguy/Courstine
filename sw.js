@@ -1,6 +1,6 @@
 /* Courstine – fonctionne hors connexion.
    Réseau d'abord (les mises à jour arrivent dès que tu es en ligne), cache en secours. */
-const CACHE = 'courstine-v1-build4';
+const CACHE = 'courstine-v2-build5';
 const FILES = [
   './', 'index.html', 'css/style.css', 'js/lib.js', 'js/store.js', 'js/app.js',
   'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png',

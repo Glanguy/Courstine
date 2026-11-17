@@ -1,4 +1,4 @@
-/* Courstine – logique pure (sans DOM) : ingrédients, totaux, semaine, partage.
+/* Courstine – logique pure (sans DOM) : ingrédients, liste de courses, import TikTok, partage.
    Utilisable dans le navigateur (window.Courstine) et dans Node (tests). */
 (function (root) {
   'use strict';
@@ -160,8 +160,14 @@
 
   const round3 = (n) => Math.round(n * 1000) / 1000;
 
-  /* lines : [{ qty, unit, name, from }]  →  articles fusionnés
-     100 g + 125 g de beurre  =>  225 g de beurre */
+  /* Identifiant d'un article de la liste : nom normalisé + unité de base */
+  function itemId(name, qty, unit) {
+    return nameKey(name) + '|' + (qty == null ? '' : toBase(qty, unit).unit);
+  }
+
+  /* lines : [{ qty, unit, name, from, occ, manual }]  →  articles fusionnés
+     100 g + 125 g de beurre  =>  225 g de beurre
+     rq = part venant des recettes, occs = repas qui ont fourni l'ingrédient */
   function aggregate(lines) {
     const byName = new Map();
     for (const ln of lines) {
@@ -169,25 +175,30 @@
       const key = nameKey(display);
       if (!key) continue;
       const b = toBase(ln.qty, ln.unit);
+      const none = b.qty == null;
       let g = byName.get(key);
       if (!g) {
-        g = { key, variants: new Map(), subs: new Map(), from: [] };
+        g = { key, variants: new Map(), subs: new Map(), from: [], nullOccs: new Set() };
         byName.set(key, g);
       }
       g.variants.set(display, (g.variants.get(display) || 0) + 1);
-      const sk = b.qty == null ? '∅' : b.unit;
+      const sk = none ? '∅' : b.unit;
       let s = g.subs.get(sk);
       if (!s) {
-        s = { unit: b.unit, qty: b.qty == null ? null : 0 };
+        s = { unit: none ? '' : b.unit, qty: none ? null : 0, rq: 0, occs: new Set() };
         g.subs.set(sk, s);
       }
-      if (b.qty != null) s.qty += b.qty;
+      if (!none) {
+        s.qty += b.qty;
+        if (!ln.manual) s.rq += b.qty;
+      }
+      if (ln.occ) (none ? g.nullOccs : s.occs).add(ln.occ);
       if (ln.from && !g.from.includes(ln.from)) g.from.push(ln.from);
     }
     const out = [];
     for (const g of byName.values()) {
       const quantified = [...g.subs.values()].filter((s) => s.qty != null);
-      const rows = quantified.length ? quantified : [{ unit: '', qty: null }];
+      const rows = quantified.length ? quantified : [g.subs.get('∅')];
       for (const s of rows) {
         const qty = s.qty == null ? null : round3(s.qty);
         const variants = [...g.variants.keys()];
@@ -209,6 +220,8 @@
           text: qtyText(qty, s.unit),
           cat: category(g.key),
           from: g.from,
+          rq: s.qty == null ? 0 : round3(s.rq),
+          occs: [...s.occs, ...g.nullOccs],
         });
       }
     }
@@ -231,19 +244,91 @@
   };
   const SLOTS = ['midi', 'soir'];
 
-  function shoppingForWeek(state, days) {
+  /* ---------- Liste de courses unique ----------
+     = ingrédients des repas prévus aujourd'hui et après
+     + ajouts et corrections à la main (state.extras, quantités signées)
+     - ce qui a déjà été acheté et supprimé (state.cleared)            */
+  const occKey = (day, slot, rid) => day + '|' + slot + '|' + rid;
+
+  function shoppingList(state, todayIso) {
     const lines = [];
     const byId = new Map(state.recipes.map((r) => [r.id, r]));
-    for (const d of days) {
-      const day = state.plan[iso(d)];
-      if (!day) continue;
+    const cleared = state.cleared || {};
+    for (const day of Object.keys(state.plan).sort()) {
+      if (day < todayIso) continue;
       for (const slot of SLOTS) {
-        const r = byId.get(day[slot]);
+        const rid = (state.plan[day] || {})[slot];
+        const r = byId.get(rid);
         if (!r) continue;
-        for (const ing of r.ingredients) lines.push({ ...ing, from: r.title });
+        const occ = occKey(day, slot, rid);
+        for (const ing of r.ingredients) {
+          if (cleared[occ + '#' + nameKey(ing.name)]) continue;
+          lines.push({ ...ing, from: r.title, occ });
+        }
       }
     }
-    return aggregate(lines);
+    for (const x of state.extras || []) lines.push({ name: x.name, qty: x.qty, unit: x.unit, manual: true });
+    const checked = state.checked || {};
+    return aggregate(lines)
+      .filter((it) => it.qty == null || it.qty > 0.0005)
+      .map((it) => {
+        const c = checked[it.id];
+        return { ...it, done: c != null && (it.qty == null || it.qty <= c + 1e-6) };
+      });
+  }
+
+  /* ---------- Description TikTok → recette ---------- */
+  const NUMBER_WORDS = {
+    un: 1, une: 1, deux: 2, trois: 3, quatre: 4, cinq: 5, six: 6, sept: 7, huit: 8,
+    neuf: 9, dix: 10, douze: 12, quinze: 15, vingt: 20, demi: 0.5, 'demie': 0.5,
+  };
+  const PIC = /\p{Extended_Pictographic}/u;
+  const QTY_END = /^(.*?[a-zà-ÿœ)])[\s:=–-]*(\d+(?:[.,]\d+)?\s*(?:kg|g|gr|grammes?|ml|cl|dl|l|litres?)\.?)$/i;
+
+  function cleanPiece(p) {
+    let s = p.replace(/^[\s\-–—•*·.)>:]+|[\s.;:]+$/g, '').replace(/^\d+[.)]\s+(?=\D)/, '').trim();
+    s = s.replace(/^(?:il\s+(?:te|vous|nous)\s+faut|il\s+faut|tu\s+as\s+besoin\s+de|prends?|prenez|ajoute[rz]?|avec)\s+/i, '');
+    const w = s.match(/^([a-zéè]+)\b\s*/i);
+    if (w && NUMBER_WORDS[strip(w[1])] != null && s.length > w[0].length) {
+      s = NUMBER_WORDS[strip(w[1])] + ' ' + s.slice(w[0].length);
+    }
+    const m = s.match(QTY_END);
+    if (m && !/^\d/.test(s)) s = m[2] + ' ' + m[1];
+    return s;
+  }
+
+  function extractRecipe(raw) {
+    let t = String(raw || '').replace(/\r/g, '').replace(/[️⃣‍]/g, '');
+    t = t.replace(/(^|\s)[#@][^\s#@]+/g, '$1');
+    const ingRx = /ingr[ée]dients?(?:\s+pour[^:\n]*)?\s*[:：]?/i;
+    const stepRx = /\n?\s*(?:pr[ée]paration|[ée]tapes?|instructions?|d[ée]roul[ée]|recette)\s*[:：]/i;
+    let head = '';
+    let body = t;
+    let steps = '';
+    const hasKeyword = ingRx.test(t);
+    if (hasKeyword) {
+      const i = t.search(ingRx);
+      head = t.slice(0, i);
+      body = t.slice(i).replace(ingRx, '');
+    }
+    const si = body.search(stepRx);
+    if (si >= 0) {
+      steps = body.slice(si).replace(stepRx, '').trim();
+      body = body.slice(0, si);
+    }
+    const pieces = body
+      .split(/\n|[;•·|!?]|,\s+|\s[-–]\s|\s\+\s|\s(?:et|puis)\s(?=\d|un\b|une\b|deux\b|trois\b|quatre\b|cinq\b|six\b|demi)|\p{Extended_Pictographic}/iu)
+      .map(cleanPiece)
+      .filter((p) => p && /[a-zà-ÿœ]/i.test(p) && p.length <= 70 && !/:$/.test(p) && !/^pour\s/i.test(p));
+    const isQty = (p) => /^(\d|[½¼¾⅓⅔])/.test(p);
+    const ings = (hasKeyword ? pieces : pieces.filter(isQty)).map(parseLine).filter(Boolean);
+    if (!hasKeyword) {
+      const firstLine = t.split('\n').find((l) => l.trim()) || '';
+      head = isQty(cleanPiece(firstLine)) ? '' : firstLine.split(/[.!?:]|,\s/)[0];
+    }
+    let title = head.split(PIC).map((x) => x.trim()).filter(Boolean)[0] || '';
+    title = title.replace(/\s+/g, ' ').replace(/[\s:–-]+$/, '').trim().slice(0, 60);
+    return { title: cap(title), ingredients: ings, steps };
   }
 
   /* ---------- Partage ---------- */
@@ -262,10 +347,13 @@
     return parts.join('\n');
   }
 
+  const UNITS = ['', 'g', 'kg', 'ml', 'cl', 'dl', 'l', 'c. à soupe', 'c. à café', 'sachet', 'pincée',
+    'gousse', 'tranche', 'boîte', 'pot', 'verre', 'botte', 'bouquet', 'paquet', 'brique', 'feuille', 'branche'];
+
   const api = {
     strip, cap, parseLine, parseIngredients, qtyText, fmtNum, ingredientLabel,
-    ingredientEditLine, nameKey, aggregate, shoppingForWeek, shareText,
-    iso, addDays, mondayOf, weekDays, SLOTS, CATEGORY_ORDER,
+    ingredientEditLine, nameKey, toBase, itemId, aggregate, occKey, shoppingList, extractRecipe, shareText,
+    iso, addDays, mondayOf, weekDays, SLOTS, CATEGORY_ORDER, UNITS,
   };
   root.Courstine = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

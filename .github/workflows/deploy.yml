@@ -1,0 +1,86 @@
+# Courstine : dépose un .zip dans le dépôt, ce workflow le décompresse
+# et met le site en ligne sur GitHub Pages. Rien d'autre à faire.
+name: Mettre le zip en ligne
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.zip'
+      - '**.ZIP'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Décompresser le zip le plus récent
+        run: |
+          set -euo pipefail
+
+          # 1. Le zip ajouté ou modifié le plus récemment
+          ZIP=""; BEST=0
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            t=$(git log -1 --format=%ct -- "$f")
+            if [ "${t:-0}" -ge "$BEST" ]; then BEST=${t:-0}; ZIP="$f"; fi
+          done < <(git ls-files -- '*.zip' '*.ZIP')
+          if [ -z "$ZIP" ]; then
+            echo "::error::Aucun fichier .zip trouvé dans le dépôt."
+            exit 1
+          fi
+          echo "Zip utilisé : $ZIP"
+
+          # 2. Décompression
+          rm -rf extract _site
+          mkdir extract _site
+          unzip -q "$ZIP" -d extract
+
+          # 3. Le dossier qui contient index.html (le moins profond)
+          INDEX=$(find extract -name index.html -not -path '*/__MACOSX/*' \
+                  | awk -F/ '{print NF "\t" $0}' | sort -n | head -n1 | cut -f2-)
+          if [ -z "$INDEX" ]; then
+            echo "::error::Pas de index.html dans $ZIP."
+            exit 1
+          fi
+          SRC=$(dirname "$INDEX")
+          echo "Site trouvé dans : $SRC"
+          cp -a "$SRC"/. _site/
+          find _site \( -name '__MACOSX' -o -name '.DS_Store' \) -prune -exec rm -rf {} +
+
+          # 4. Nouveau nom de cache à chaque mise en ligne,
+          #    pour que les téléphones prennent la mise à jour
+          if [ -f _site/sw.js ]; then
+            sed -i -E "s/(const CACHE = '[^']*)'/\1-build${GITHUB_RUN_NUMBER}'/" _site/sw.js
+            grep -m1 "const CACHE" _site/sw.js
+          fi
+
+      - name: Préparer GitHub Pages
+        uses: actions/configure-pages@v6
+
+      - name: Envoyer le site
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+      - name: Mettre en ligne
+        id: deployment
+        uses: actions/deploy-pages@v5
